@@ -31,7 +31,7 @@ agent = Agent(
 )
 
 agent.train(
-    episodes=600,
+    episodes=1800,
     batch_size=256,
     eval_interval=50,
     eval_episodes=20,
