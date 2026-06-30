@@ -1,0 +1,10 @@
+opencv-python==4.10.0.84
+tensorboard
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch
+torchvision
+# Pinned to a commit SHA, not @main: pip treats an unchanged git URL as
+# "already satisfied" and never re-clones, so env changes silently never reach
+# the Beekeeper install. Bump this SHA whenever homebot changes.
+# de9c437 = tighten package pickup to the doorway (own _DOOR_RANGE, 47px).
+git+https://github.com/bobcowher/gym-homebot-2d.git@de9c437bf12980b58bf287c47d2085b5f4c21760
