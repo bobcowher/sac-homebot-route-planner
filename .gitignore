@@ -1,0 +1,8 @@
+checkpoints/
+runs/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+.claude/
+CLAUDE.md
