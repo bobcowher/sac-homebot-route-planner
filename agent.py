@@ -52,7 +52,8 @@ class Agent:
                  lr: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
-                 alpha_init: float = 0.2) -> None:
+                 alpha_init: float = 0.2,
+                 fixed_alpha: float = None) -> None:
         self.env = env
         self.random_goal_tiles = random_goal_tiles
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -98,8 +99,7 @@ class Agent:
         self.actor_optimizer  = torch.optim.Adam(self.actor.parameters(),  lr=lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
 
-        # Auto-alpha: log_alpha is the learnable log temperature.
-        # target_entropy = -action_dim (standard SAC heuristic).
+        self._fixed_alpha = fixed_alpha
         self.target_entropy = -float(ACTION_DIM)
         self.log_alpha = torch.tensor(math.log(alpha_init), dtype=torch.float32,
                                       device=self.device, requires_grad=True)
@@ -129,6 +129,8 @@ class Agent:
 
     @property
     def alpha(self):
+        if self._fixed_alpha is not None:
+            return self._fixed_alpha
         return self.log_alpha.exp().item()
 
     def _reset_goal(self, base, desired_goal):
@@ -189,13 +191,13 @@ class Agent:
         dones   = dones.unsqueeze(1).float()
 
         # --- Critic update ---
+        alpha = self.alpha  # float: fixed or exp(log_alpha)
         with torch.no_grad():
             next_actions, next_log_pi, _ = self.actor.sample(
                 next_obs, next_goals, next_motions)
             q1_target, q2_target = self.target_critic(
                 next_obs, next_actions, next_goals, next_motions)
             min_q_target = torch.min(q1_target, q2_target)
-            alpha = self.log_alpha.exp()
             y = rewards + (1 - dones) * self.gamma * (min_q_target - alpha * next_log_pi)
 
         q1, q2 = self.critic(obs, actions, goals, motions)
@@ -209,7 +211,6 @@ class Agent:
         # --- Actor update ---
         new_actions, log_pi, _ = self.actor.sample(obs, goals, motions)
         q1_pi = self.critic.Q1(obs, new_actions, goals, motions)
-        alpha = self.log_alpha.exp()
         actor_loss = (alpha * log_pi - q1_pi).mean()
 
         self.actor_optimizer.zero_grad()
@@ -217,17 +218,18 @@ class Agent:
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
 
-        # --- Alpha update ---
-        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+        # --- Alpha update (skipped when alpha is fixed) ---
+        if self._fixed_alpha is None:
+            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
 
         # Polyak update target critics
         self._polyak_update()
 
         self.total_grad_steps += 1
-        return critic_loss.item(), actor_loss.item(), alpha.item()
+        return critic_loss.item(), actor_loss.item(), alpha
 
     # ------------------------------------------------------------------
     # Eval
