@@ -96,32 +96,55 @@ class EpisodeBuffer:
         desired_goal: np.ndarray,
         compute_reward: Callable,
         k: float | None = None,
+        n_step: int = 1,
+        gamma: float = 0.99,
     ) -> None:
         """Write original transitions then k hindsight-relabeled copies.
 
         `k` is the (possibly fractional) hindsight count; defaults to class K.
         Stochastically rounded so a fractional k hits the target ratio in expectation.
+
+        `n_step` windows up to n consecutive transitions into one multi-step return,
+        stopping early at episode end (pass 1) or at a positive relabeled reward
+        (pass 2 — the HER done-fix: a window must stop the instant it hits the
+        relabeled goal, or it would bootstrap past it). The per-transition bootstrap
+        discount (gamma**n_eff) is stored alongside the transition since n_eff varies.
+        n_step=1 reduces exactly to the original single-step behavior.
         """
         dg = desired_goal
         k = self.K if k is None else k
         adim = self._action_dim
+        T = self._transitions
 
-        # Pass 1: original transitions
-        for i, t in enumerate(self._transitions):
+        # Pass 1: original transitions, windowed against the true desired goal
+        for i in range(len(T)):
+            t = T[i]
+            R, discount, n_eff, done_flag = 0.0, 1.0, 0, False
+            for j in range(i, min(i + n_step, len(T))):
+                tj = T[j]
+                r_j = tj.reward + _blocked_penalty(tj) + _spin_penalty(tj, j, adim)
+                R += discount * r_j
+                discount *= gamma
+                n_eff += 1
+                if tj.done:
+                    done_flag = True
+                    break
+            last = T[i + n_eff - 1]
             goal_at_s  = world_coords(t.achieved_prev[0], t.achieved_prev[1],
                                       dg[0], dg[1], t.angle_prev)
-            goal_at_sp = world_coords(t.achieved_next[0], t.achieved_next[1],
-                                      dg[0], dg[1], t.angle_next)
-            r = t.reward + _blocked_penalty(t) + _spin_penalty(t, i, adim)
+            goal_at_sp = world_coords(last.achieved_next[0], last.achieved_next[1],
+                                      dg[0], dg[1], last.angle_next)
             replay_buffer.store_transition(
-                t.obs, t.action, r, t.next_obs, t.done,
+                t.obs, t.action, R, last.next_obs, done_flag,
                 goal_at_s, goal_at_sp,
-                motion=t.motion_prev, next_motion=t.motion_next,
+                motion=t.motion_prev, next_motion=last.motion_next,
+                discount=gamma ** n_eff,
             )
 
-        # Pass 2: hindsight transitions
-        for i, t in enumerate(self._transitions):
-            future = self._transitions[i + 1:]
+        # Pass 2: hindsight transitions, windowed against a fixed relabeled goal
+        for i in range(len(T)):
+            t = T[i]
+            future = T[i + 1:]
             if not future:
                 continue
             kk = int(k) + (1 if random.random() < (k - int(k)) else 0)
@@ -129,24 +152,35 @@ class EpisodeBuffer:
             if kk <= 0:
                 continue
             for hg_t in random.sample(future, kk):
-                hindsight_goal   = hg_t.achieved_next
-                hindsight_reward = float(compute_reward(
-                    t.achieved_next[np.newaxis],
-                    hindsight_goal[np.newaxis],
-                    {},
-                )[0])
-                # HER done-fix: relabeled successes MUST be terminal so targets
-                # don't bootstrap past the goal (the biggest single win in Q-DQN).
-                hindsight_done = hindsight_reward > 0.5
-                r = hindsight_reward + _blocked_penalty(t) + _spin_penalty(t, i, adim)
+                hindsight_goal = hg_t.achieved_next
+
+                R, discount, n_eff, done_flag = 0.0, 1.0, 0, False
+                for j in range(i, min(i + n_step, len(T))):
+                    tj = T[j]
+                    hindsight_reward = float(compute_reward(
+                        tj.achieved_next[np.newaxis],
+                        hindsight_goal[np.newaxis],
+                        {},
+                    )[0])
+                    r_j = hindsight_reward + _blocked_penalty(tj) + _spin_penalty(tj, j, adim)
+                    R += discount * r_j
+                    discount *= gamma
+                    n_eff += 1
+                    # HER done-fix: stop the instant the relabeled goal is hit so
+                    # the target doesn't bootstrap past it (the Q-DQN regression bug).
+                    if hindsight_reward > 0.5:
+                        done_flag = True
+                        break
+                last = T[i + n_eff - 1]
                 hs_goal_at_s  = world_coords(t.achieved_prev[0], t.achieved_prev[1],
                                              hindsight_goal[0], hindsight_goal[1],
                                              t.angle_prev)
-                hs_goal_at_sp = world_coords(t.achieved_next[0], t.achieved_next[1],
+                hs_goal_at_sp = world_coords(last.achieved_next[0], last.achieved_next[1],
                                              hindsight_goal[0], hindsight_goal[1],
-                                             t.angle_next)
+                                             last.angle_next)
                 replay_buffer.store_transition(
-                    t.obs, t.action, r, t.next_obs, hindsight_done,
+                    t.obs, t.action, R, last.next_obs, done_flag,
                     hs_goal_at_s, hs_goal_at_sp,
-                    motion=t.motion_prev, next_motion=t.motion_next,
+                    motion=t.motion_prev, next_motion=last.motion_next,
+                    discount=gamma ** n_eff,
                 )

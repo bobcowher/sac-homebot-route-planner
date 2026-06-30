@@ -28,6 +28,7 @@ agent = Agent(
     use_motion=True,
     motion_window=8,
     random_goal_tiles=True,
+    n_step=3,
 )
 
 agent.train(

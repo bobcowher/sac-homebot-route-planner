@@ -24,6 +24,9 @@ class ReplayBuffer:
         self.action_memory     = torch.zeros((max_size, action_dim),   dtype=torch.float32, device=self.input_device)
         self.reward_memory     = torch.zeros(max_size,                 dtype=torch.float32, device=self.input_device)
         self.terminal_memory   = torch.zeros(max_size,                 dtype=torch.bool,    device=self.input_device)
+        # Per-transition bootstrap discount (gamma**n_eff); n_eff varies near episode
+        # ends / hindsight-goal hits, so this can't be a single global gamma**n constant.
+        self.discount_memory   = torch.zeros(max_size,                 dtype=torch.float32, device=self.input_device)
         self.goal_memory       = torch.zeros((max_size, goal_dim),     dtype=torch.float32, device=self.input_device)
         self.next_goal_memory  = torch.zeros((max_size, goal_dim),     dtype=torch.float32, device=self.input_device)
 
@@ -36,7 +39,7 @@ class ReplayBuffer:
         return self.mem_ctr >= batch_size * 10
 
     def store_transition(self, state, action, reward, next_state, done, goal, next_goal,
-                         motion=None, next_motion=None):
+                         motion=None, next_motion=None, discount=None):
         idx = self.mem_ctr % self.mem_size
         self.state_memory[idx]      = torch.as_tensor(state,      dtype=torch.uint8,   device=self.input_device)
         self.next_state_memory[idx] = torch.as_tensor(next_state, dtype=torch.uint8,   device=self.input_device)
@@ -45,6 +48,7 @@ class ReplayBuffer:
         self.terminal_memory[idx]   = bool(done)
         self.goal_memory[idx]       = torch.as_tensor(goal,      dtype=torch.float32, device=self.input_device)
         self.next_goal_memory[idx]  = torch.as_tensor(next_goal, dtype=torch.float32, device=self.input_device)
+        self.discount_memory[idx]   = float(discount)
         if self.use_motion:
             self.motion_memory[idx]      = torch.as_tensor(motion,      dtype=torch.float32, device=self.input_device)
             self.next_motion_memory[idx] = torch.as_tensor(next_motion, dtype=torch.float32, device=self.input_device)
@@ -61,10 +65,11 @@ class ReplayBuffer:
         dones       = self.terminal_memory[batch].to(self.output_device)
         goals       = self.goal_memory[batch].to(self.output_device)
         next_goals  = self.next_goal_memory[batch].to(self.output_device)
+        discounts   = self.discount_memory[batch].to(self.output_device)
 
         motions = next_motions = None
         if self.use_motion:
             motions      = self.motion_memory[batch].to(self.output_device)
             next_motions = self.next_motion_memory[batch].to(self.output_device)
 
-        return states, actions, rewards, next_states, dones, goals, next_goals, motions, next_motions
+        return states, actions, rewards, next_states, dones, goals, next_goals, motions, next_motions, discounts

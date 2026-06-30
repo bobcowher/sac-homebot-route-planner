@@ -53,11 +53,13 @@ class Agent:
                  gamma: float = 0.99,
                  tau: float = 0.005,
                  alpha_init: float = 0.2,
-                 fixed_alpha: float = None) -> None:
+                 fixed_alpha: float = None,
+                 n_step: int = 1) -> None:
         self.env = env
         self.random_goal_tiles = random_goal_tiles
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.gamma = gamma
+        self.n_step = n_step
         self.tau = tau
         self.use_motion = use_motion
         self.motion_window = motion_window
@@ -182,13 +184,15 @@ class Agent:
 
     def train_step(self, batch_size: int):
         (obs, actions, rewards, next_obs, dones,
-         goals, next_goals, motions, next_motions) = self.memory.sample_buffer(batch_size)
+         goals, next_goals, motions, next_motions,
+         discounts) = self.memory.sample_buffer(batch_size)
 
         obs      = obs      / 255.0
         next_obs = next_obs / 255.0
 
-        rewards = rewards.unsqueeze(1)  # (B, 1)
-        dones   = dones.unsqueeze(1).float()
+        rewards   = rewards.unsqueeze(1)    # (B, 1)
+        dones     = dones.unsqueeze(1).float()
+        discounts = discounts.unsqueeze(1)  # gamma**n_eff, varies per transition under n-step
 
         # --- Critic update ---
         alpha = self.alpha  # float: fixed or exp(log_alpha)
@@ -198,7 +202,7 @@ class Agent:
             q1_target, q2_target = self.target_critic(
                 next_obs, next_actions, next_goals, next_motions)
             min_q_target = torch.min(q1_target, q2_target)
-            y = rewards + (1 - dones) * self.gamma * (min_q_target - alpha * next_log_pi)
+            y = rewards + (1 - dones) * discounts * (min_q_target - alpha * next_log_pi)
 
         q1, q2 = self.critic(obs, actions, goals, motions)
         critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
@@ -513,6 +517,8 @@ class Agent:
                 desired_goal=desired_goal,
                 compute_reward=her_reward,
                 k=k_eff,
+                n_step=self.n_step,
+                gamma=self.gamma,
             )
             self.episode_buffer.clear()
             writer.add_scalar("Train/hindsight_k", k_eff, episode)
