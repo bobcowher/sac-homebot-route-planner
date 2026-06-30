@@ -298,7 +298,7 @@ class Agent:
                 break
         return False, steps, obs, positions
 
-    def chain_eval(self, n_episodes: int = 5):
+    def chain_eval(self, n_episodes: int = 10):
         """The real deployment metric: chained task score.
 
         Returns (mean_score, full_chain_rate, mean_spin).

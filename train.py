@@ -28,7 +28,6 @@ agent = Agent(
     use_motion=True,
     motion_window=8,
     random_goal_tiles=True,
-    fixed_alpha=0.1,
 )
 
 agent.train(
