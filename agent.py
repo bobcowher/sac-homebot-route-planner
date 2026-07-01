@@ -53,12 +53,15 @@ class Agent:
                  gamma: float = 0.99,
                  tau: float = 0.005,
                  alpha_init: float = 0.2,
-                 fixed_alpha: float = None) -> None:
+                 fixed_alpha: float = None,
+                 target_entropy: float = None,
+                 min_alpha: float = 0.01) -> None:
         self.env = env
         self.random_goal_tiles = random_goal_tiles
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.gamma = gamma
         self.tau = tau
+        self.min_alpha = min_alpha
         self.use_motion = use_motion
         self.motion_window = motion_window
 
@@ -100,10 +103,16 @@ class Agent:
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
 
         self._fixed_alpha = fixed_alpha
-        self.target_entropy = -float(ACTION_DIM)
+        # Haarnoja's -|A| default is trivially satisfied by a 2D Gaussian (std~0.09
+        # already meets it), so auto-alpha collapses within ~70 episodes and
+        # exploration switches off long before the goal-conditioned state space
+        # (random_goal_tiles=True, full 5-leg chain never directly rolled out) is
+        # covered. A softer target keeps alpha — and exploration — alive longer.
+        self.target_entropy = target_entropy if target_entropy is not None else -float(ACTION_DIM)
         self.log_alpha = torch.tensor(math.log(alpha_init), dtype=torch.float32,
                                       device=self.device, requires_grad=True)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
+        self._log_min_alpha = math.log(min_alpha)
 
         self.memory = ReplayBuffer(
             max_size=max_buffer_size,
@@ -224,6 +233,10 @@ class Agent:
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
+            # Floor: never let entropy pressure fully switch off (premature
+            # exploration collapse — see target_entropy comment in __init__).
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=self._log_min_alpha)
 
         # Polyak update target critics
         self._polyak_update()

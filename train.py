@@ -28,10 +28,14 @@ agent = Agent(
     use_motion=True,
     motion_window=8,
     random_goal_tiles=True,
+    target_entropy=-1.0,   # softer than -ACTION_DIM=-2.0; keeps entropy pressure alive longer
+    min_alpha=0.01,        # floor so exploration can't fully switch off
 )
 
+# 1000 eps, not 3500: this run is testing convergence SPEED against Q-DQN's
+# 500-600 episode budget, not chasing a ceiling.
 agent.train(
-    episodes=3500,
+    episodes=1000,
     batch_size=256,
     eval_interval=50,
     eval_episodes=20,
