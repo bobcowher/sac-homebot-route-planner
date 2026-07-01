@@ -31,12 +31,16 @@ agent = Agent(
     target_entropy=-1.0,      # isolate this alone vs 409's -2.0; no alpha floor this time
 )
 
-# 1800 eps: run 414 (same config, 1000 eps) peaked 4.60/5 chain_score and 70%
-# chain_full at ep860 but was still oscillating (unstable trend), not fully
-# consolidated by ep1000. Extending to see if it stabilizes at/above that
-# peak instead of continuing to wobble.
+# 3500 eps: matches run 409's exact budget for a fair comparison. Run 415
+# (same config, 1800 eps) sustained-window average was 3.68/5, 30.4% full-
+# chain -- worse than 409's real sustained number (4.29/5, 60%, corrected
+# from an earlier cherry-picked "final raw" reading). Does the faster ramp
+# to peak capability (ep860-1370 vs 409's slower climb) convert into a
+# BETTER sustained result once given the same total training time, or is
+# 409's more conservative default target_entropy actually more stable long
+# run despite starting slower?
 agent.train(
-    episodes=1800,
+    episodes=3500,
     batch_size=256,
     eval_interval=50,
     eval_episodes=20,
