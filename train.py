@@ -31,11 +31,12 @@ agent = Agent(
     target_entropy=-1.0,      # isolate this alone vs 409's -2.0; no alpha floor this time
 )
 
-# 1000 eps, not 3500: testing convergence SPEED against Q-DQN's 500-600
-# episode budget, and against 409's 1000-episode checkpoint (already perfect
-# 5.0/5 chain_score, 100% chain_full by then).
+# 1800 eps: run 414 (same config, 1000 eps) peaked 4.60/5 chain_score and 70%
+# chain_full at ep860 but was still oscillating (unstable trend), not fully
+# consolidated by ep1000. Extending to see if it stabilizes at/above that
+# peak instead of continuing to wobble.
 agent.train(
-    episodes=1000,
+    episodes=1800,
     batch_size=256,
     eval_interval=50,
     eval_episodes=20,
