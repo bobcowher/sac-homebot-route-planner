@@ -55,13 +55,13 @@ class Agent:
                  alpha_init: float = 0.2,
                  fixed_alpha: float = None,
                  target_entropy: float = None,
-                 min_alpha: float = 0.01) -> None:
+                 min_alpha_start: float = 0.05,
+                 min_alpha_end: float = 0.001) -> None:
         self.env = env
         self.random_goal_tiles = random_goal_tiles
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.gamma = gamma
         self.tau = tau
-        self.min_alpha = min_alpha
         self.use_motion = use_motion
         self.motion_window = motion_window
 
@@ -112,7 +112,14 @@ class Agent:
         self.log_alpha = torch.tensor(math.log(alpha_init), dtype=torch.float32,
                                       device=self.device, requires_grad=True)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
-        self._log_min_alpha = math.log(min_alpha)
+        # Annealed floor: high early (run 412 showed a FLAT floor of 0.01 for the
+        # whole run overcorrects — the policy never got to consolidate, chain_full
+        # stayed at 0% the entire 1000 eps). Start high enough to survive the
+        # ~ep70 collapse window seen in every prior run, decay toward the natural
+        # unclamped settling point (~0.0008) so late training can still exploit.
+        self._log_min_alpha_start = math.log(min_alpha_start)
+        self._log_min_alpha_end   = math.log(min_alpha_end)
+        self._log_min_alpha = self._log_min_alpha_start
 
         self.memory = ReplayBuffer(
             max_size=max_buffer_size,
@@ -457,6 +464,11 @@ class Agent:
                 reach_radius = reach_radius_at(episode, reach_start, reach_end,
                                                reach_anneal_start, reach_anneal_end)
                 writer.add_scalar('Train/reach_radius', reach_radius, episode)
+
+            frac = episode / max(1, episodes - 1)
+            self._log_min_alpha = (self._log_min_alpha_start
+                                   + frac * (self._log_min_alpha_end - self._log_min_alpha_start))
+            writer.add_scalar('Train/min_alpha', math.exp(self._log_min_alpha), episode)
 
             done = False
             episode_reward = 0.0

@@ -28,8 +28,9 @@ agent = Agent(
     use_motion=True,
     motion_window=8,
     random_goal_tiles=True,
-    target_entropy=-1.0,   # softer than -ACTION_DIM=-2.0; keeps entropy pressure alive longer
-    min_alpha=0.01,        # floor so exploration can't fully switch off
+    target_entropy=-1.0,      # softer than -ACTION_DIM=-2.0; keeps entropy pressure alive longer
+    min_alpha_start=0.05,     # high early: survive the ~ep70 collapse window
+    min_alpha_end=0.001,      # decays to ~the natural settling point so late training can exploit
 )
 
 # 1000 eps, not 3500: this run is testing convergence SPEED against Q-DQN's
