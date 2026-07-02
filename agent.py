@@ -12,8 +12,8 @@ import cv2
 from buffer import ReplayBuffer
 from episode_buffer import EpisodeBuffer
 from goal_geometry import (world_coords, spin_fraction, spin_thresholds,
-                           SPIN_WINDOW, reach_reward, reach_radius_at, distance,
-                           eval_step_budget, GOAL_RADIUS)
+                           SPIN_WINDOW, reach_reward, distance,
+                           eval_step_budget)
 from motion import MotionState, motion_dim
 from models.actor import GaussianActor
 from models.critic import TwinQCritic
@@ -48,14 +48,12 @@ class Agent:
                  head_layers: int = 4,
                  use_motion: bool = True,
                  motion_window: int = 8,
-                 random_goal_tiles: bool = True,
                  lr: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
                  alpha_init: float = 0.2,
                  fixed_alpha: float = None) -> None:
         self.env = env
-        self.random_goal_tiles = random_goal_tiles
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.gamma = gamma
         self.tau = tau
@@ -66,7 +64,7 @@ class Agent:
         os.makedirs("runs", exist_ok=True)
 
         raw_obs, _ = self.env.reset()
-        obs = process_observation(raw_obs["observation"])
+        obs = process_observation(raw_obs)
         self.obs_shape = obs.shape   # (3, 96, 96)
         self.frame_skip = getattr(self.env, "_skip", 1)
 
@@ -120,6 +118,7 @@ class Agent:
         self.total_grad_steps = 0
         self.updates_per_step = 1
         self.best_chain_score = -1.0
+        self.best_confirmed_score = -1.0
 
         self._chain_env = None
 
@@ -133,15 +132,12 @@ class Agent:
             return self._fixed_alpha
         return self.log_alpha.exp().item()
 
-    def _reset_goal(self, base, desired_goal):
-        if not self.random_goal_tiles:
-            return desired_goal
+    def _sample_goal(self, base):
+        """Random floor-tile goal in pixel coords (no env coupling)."""
         tiles = base._map.valid_floor_tiles()
         col, row = tiles[int(base.np_random.integers(0, len(tiles)))]
         gx, gy = base._map.tile_to_pixel(col, row)
-        goal = np.array([float(gx), float(gy)], dtype=np.float32)
-        base._desired_goal = goal
-        return goal
+        return np.array([float(gx), float(gy)], dtype=np.float32)
 
     def _to_tensor(self, obs, goal, motion):
         obs_t = obs.unsqueeze(0).float().to(self.device) / 255.0
@@ -236,26 +232,25 @@ class Agent:
     # ------------------------------------------------------------------
 
     def greedy_eval(self, n_episodes: int = 20, stochastic: bool = True) -> float:
-        """Single-goal reach rate.
+        """Single-goal reach rate on the base env (one random-tile goal).
 
         stochastic=True uses actor.sample() (the SAC deployment policy);
         stochastic=False uses tanh(mu) (deterministic mean, for comparison).
+        Budget matches the old Goal-env regime (1000 env steps).
         """
         self.actor.eval()
         successes = 0
+        budget = max(1, 1000 // self.frame_skip)
 
         for _ in range(n_episodes):
             raw_obs, _ = self.env.reset()
-            obs          = process_observation(raw_obs["observation"])
-            desired_goal = raw_obs["desired_goal"]
-            base         = self.env.unwrapped
-            r            = base._robot
-            desired_goal = self._reset_goal(base, desired_goal)
+            obs  = process_observation(raw_obs)
+            base = self.env.unwrapped
+            r    = base._robot
+            desired_goal = self._sample_goal(base)
             ms = MotionState(ACTION_DIM, self.motion_window)
 
-            done = False
-            ep_reward = 0.0
-            while not done:
+            for _ in range(budget):
                 goal_vec = world_coords(r.x, r.y, desired_goal[0], desired_goal[1],
                                         r.angle)
                 motion = ms.vec(r.x, r.y)
@@ -263,43 +258,24 @@ class Agent:
                     action = self.select_action(obs, goal_vec, motion)
                 else:
                     action = self.select_mean_action(obs, goal_vec, motion)
-                prev_x, prev_y = r.x, r.y
                 ms.commit(r.x, r.y, action)
-                raw_next, reward, term, trunc, _ = self.env.step(action)
-                obs = process_observation(raw_next["observation"])
-                ep_reward += float(reward)
-                done = term or trunc
-
-            if ep_reward > 0.5:
-                successes += 1
+                raw_next, _, term, trunc, _ = self.env.step(action)
+                obs = process_observation(raw_next)
+                if distance(r.x, r.y, desired_goal[0], desired_goal[1]) <= GOAL_THRESHOLD:
+                    successes += 1
+                    break
+                if term or trunc:
+                    break
 
         self.actor.train()
         return successes / n_episodes
 
-    def _run_chain_leg(self, obs, env, base, goal_xy, budget, ms):
-        """Drive toward goal_xy. Returns (reached, steps, obs, positions)."""
-        robot = base._robot
-        positions = [(robot.x, robot.y)]
-        steps = 0
-        reach_r = _REACH_OVERRIDE.get("__this_leg__", GOAL_THRESHOLD)  # caller sets this
-        while steps < budget:
-            goal_vec = world_coords(robot.x, robot.y, goal_xy[0], goal_xy[1],
-                                    robot.angle)
-            motion = ms.vec(robot.x, robot.y)
-            action = self.select_action(obs, goal_vec, motion)
-            ms.commit(robot.x, robot.y, action)
-            raw_next, _, term, trunc, _ = env.step(action)
-            obs = process_observation(raw_next["observation"])
-            positions.append((robot.x, robot.y))
-            steps += 1
-            if distance(robot.x, robot.y, goal_xy[0], goal_xy[1]) <= reach_r:
-                return True, steps, obs, positions
-            if term or trunc:
-                break
-        return False, steps, obs, positions
-
-    def chain_eval(self, n_episodes: int = 10):
+    def chain_eval(self, n_episodes: int = 10, seed_offset: int = 0):
         """The real deployment metric: chained task score.
+
+        seed_offset shifts the eval seeds — confirmation evals use held-out
+        seeds so the noisy windows that produced a "best" reading can't
+        confirm themselves.
 
         Returns (mean_score, full_chain_rate, mean_spin).
         """
@@ -324,7 +300,7 @@ class Agent:
 
         for seed in range(n_episodes):
             base = self._chain_env.unwrapped
-            raw_obs, _ = self._chain_env.reset(seed=seed)
+            raw_obs, _ = self._chain_env.reset(seed=seed_offset + seed)
             obs = process_observation(raw_obs)
             ms = MotionState(ACTION_DIM, self.motion_window)
 
@@ -386,16 +362,20 @@ class Agent:
     def load(self):
         self.actor.load_the_model("actor", device=self.device)
 
-    def save_best(self, episode, chain_score):
-        path = "checkpoints/best.pt"
-        torch.save({
+    def save_best(self, episode, chain_score, chain_full=None,
+                  path="checkpoints/best.pt"):
+        payload = {
             "actor":       self.actor.state_dict(),
             "critic":      self.critic.state_dict(),
             "log_alpha":   self.log_alpha.item(),
             "episode":     int(episode),
             "chain_score": float(chain_score),
-        }, path)
-        print(f"  New best checkpoint saved (episode={episode}, chain_score={chain_score:.2f})")
+        }
+        if chain_full is not None:
+            payload["chain_full"] = float(chain_full)
+        torch.save(payload, path)
+        print(f"  New best checkpoint saved ({path}, episode={episode}, "
+              f"chain_score={chain_score:.2f})")
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -403,14 +383,18 @@ class Agent:
 
     def train(self, episodes=1000, batch_size=256, run_tag=None,
               eval_interval=50, eval_episodes=20, chain_eval_interval=10,
-              her_anneal_start=None,
-              reach_start=None, reach_end=None,
-              reach_anneal_start=0, reach_anneal_end=None):
+              goals_per_episode=5, her_anneal_start=None,
+              confirm_bar=4.2, confirm_episodes=30):
+        """Chain-style training on the base (non-goal) env.
 
-        use_reach_curriculum = reach_start is not None
-        if use_reach_curriculum and reach_anneal_end is None:
-            reach_anneal_end = episodes
-
+        Each episode: one reset, then `goals_per_episode` sequential random-tile
+        goals. Heading and the motion window persist across goal switches, so
+        training covers the mid-chain state distribution that chain_eval
+        actually visits — the old single-goal Goal-env loop never sampled it.
+        Reward/termination are computed here (distance <= GOAL_THRESHOLD, the
+        same rule HER relabeling uses); each leg flushes to HER under its own
+        goal, with per-leg budgets mirroring chain_eval's eval_step_budget.
+        """
         if run_tag is None:
             try:
                 refs = subprocess.check_output(
@@ -431,96 +415,108 @@ class Agent:
         writer = SummaryWriter(
             f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{run_tag}')
 
+        her_reward = lambda a, d, info: reach_reward(a, d, GOAL_THRESHOLD)
+
         for episode in range(episodes):
-            raw_obs, _   = self.env.reset()
-            obs          = process_observation(raw_obs["observation"])
-            desired_goal = raw_obs["desired_goal"]
-            base         = self.env.unwrapped
-            r            = base._robot
-            desired_goal = self._reset_goal(base, desired_goal)
+            raw_obs, _ = self.env.reset()
+            obs  = process_observation(raw_obs)
+            base = self.env.unwrapped
+            r    = base._robot
+            # Motion state persists across goal switches within the episode —
+            # that carryover IS the chain-context distribution we're after.
             ms = MotionState(ACTION_DIM, self.motion_window)
 
-            if use_reach_curriculum:
-                reach_radius = reach_radius_at(episode, reach_start, reach_end,
-                                               reach_anneal_start, reach_anneal_end)
-                writer.add_scalar('Train/reach_radius', reach_radius, episode)
-
-            done = False
-            episode_reward = 0.0
-            episode_critic_loss = 0.0
-            episode_actor_loss  = 0.0
-            episode_steps = 0
-
-            while not done:
-                angle_prev   = r.angle
-                pos_prev     = np.array([r.x, r.y], dtype=np.float32)
-                goal_vec     = world_coords(r.x, r.y, desired_goal[0], desired_goal[1],
-                                            r.angle)
-                motion_prev  = ms.vec(r.x, r.y)
-
-                action = self.select_action(obs, goal_vec, motion_prev)
-                ms.commit(r.x, r.y, action)
-
-                raw_next, env_reward, env_term, trunc, _ = self.env.step(action)
-                pos_next   = np.array([r.x, r.y], dtype=np.float32)
-                angle_next = r.angle
-
-                if use_reach_curriculum:
-                    reward = float(reach_reward(pos_next, desired_goal, reach_radius))
-                    term   = reward > 0.5
-                else:
-                    reward, term = float(env_reward), bool(env_term)
-
-                next_obs    = process_observation(raw_next["observation"])
-                motion_next = ms.vec(pos_next[0], pos_next[1])
-                # Store term (not trunc): timeout is not a terminal state.
-                self.episode_buffer.store(
-                    obs, action, reward, next_obs, term,
-                    achieved_prev=pos_prev,
-                    achieved_next=pos_next,
-                    angle_prev=angle_prev,
-                    angle_next=angle_next,
-                    motion_prev=motion_prev,
-                    motion_next=motion_next,
-                )
-
-                episode_reward += reward
-                episode_steps  += 1
-                self.total_env_steps += 1
-                obs = next_obs
-                done = term or trunc
-
-                # UTD = 1 update per env step
-                for _ in range(self.updates_per_step):
-                    if self.memory.can_sample(batch_size):
-                        c_loss, a_loss, _ = self.train_step(batch_size)
-                        episode_critic_loss += c_loss
-                        episode_actor_loss  += a_loss
-
-            # HER
             k_eff = self.episode_buffer.K
             if her_anneal_start is not None and episode >= her_anneal_start:
                 span = max(1, episodes - her_anneal_start)
                 frac = min(1.0, (episode - her_anneal_start) / span)
                 k_eff = self.episode_buffer.K * (1.0 - frac)
 
-            her_reward = (
-                (lambda a, d, info: reach_reward(a, d, reach_radius))
-                if use_reach_curriculum
-                else self.env.unwrapped.compute_reward)  # type: ignore[attr-defined]
-            self.episode_buffer.send_to(
-                self.memory,
-                desired_goal=desired_goal,
-                compute_reward=her_reward,
-                k=k_eff,
-            )
-            self.episode_buffer.clear()
+            episode_reward = 0.0
+            episode_critic_loss = 0.0
+            episode_actor_loss  = 0.0
+            episode_steps = 0
+            legs_reached  = 0
+            env_over = False
+
+            for _leg in range(goals_per_episode):
+                desired_goal = self._sample_goal(base)
+                budget = max(1, eval_step_budget(
+                    distance(r.x, r.y, desired_goal[0], desired_goal[1]))
+                    // self.frame_skip)
+
+                for _step in range(budget):
+                    angle_prev   = r.angle
+                    pos_prev     = np.array([r.x, r.y], dtype=np.float32)
+                    goal_vec     = world_coords(r.x, r.y, desired_goal[0],
+                                                desired_goal[1], r.angle)
+                    motion_prev  = ms.vec(r.x, r.y)
+
+                    action = self.select_action(obs, goal_vec, motion_prev)
+                    ms.commit(r.x, r.y, action)
+
+                    raw_next, _, env_term, trunc, _ = self.env.step(action)
+                    pos_next   = np.array([r.x, r.y], dtype=np.float32)
+                    angle_next = r.angle
+
+                    reached = distance(pos_next[0], pos_next[1], desired_goal[0],
+                                       desired_goal[1]) <= GOAL_THRESHOLD
+                    reward = 1.0 if reached else 0.0
+                    # Goal-conditioned terminal on reach (HER done semantics);
+                    # leg timeout is truncation, never terminal.
+                    term = reached
+
+                    next_obs    = process_observation(raw_next)
+                    motion_next = ms.vec(pos_next[0], pos_next[1])
+                    self.episode_buffer.store(
+                        obs, action, reward, next_obs, term,
+                        achieved_prev=pos_prev,
+                        achieved_next=pos_next,
+                        angle_prev=angle_prev,
+                        angle_next=angle_next,
+                        motion_prev=motion_prev,
+                        motion_next=motion_next,
+                    )
+
+                    episode_reward += reward
+                    episode_steps  += 1
+                    self.total_env_steps += 1
+                    obs = next_obs
+
+                    # UTD = 1 update per env step
+                    for _ in range(self.updates_per_step):
+                        if self.memory.can_sample(batch_size):
+                            c_loss, a_loss, _ = self.train_step(batch_size)
+                            episode_critic_loss += c_loss
+                            episode_actor_loss  += a_loss
+
+                    if reached:
+                        legs_reached += 1
+                        break
+                    if env_term or trunc:
+                        env_over = True
+                        break
+
+                # Flush this leg to HER under its own goal; the next leg is a
+                # fresh (s, g') stream — no bootstrapping across the switch.
+                self.episode_buffer.send_to(
+                    self.memory,
+                    desired_goal=desired_goal,
+                    compute_reward=her_reward,
+                    k=k_eff,
+                )
+                self.episode_buffer.clear()
+
+                if env_over:
+                    break
+
             writer.add_scalar("Train/hindsight_k", k_eff, episode)
+            writer.add_scalar("Train/legs_reached", legs_reached, episode)
 
             avg_c = episode_critic_loss / max(1, episode_steps)
             avg_a = episode_actor_loss  / max(1, episode_steps)
             alpha  = self.alpha
-            print(f"Episode {episode} | reward: {episode_reward:.1f} | "
+            print(f"Episode {episode} | legs: {legs_reached}/{goals_per_episode} | "
                   f"steps: {episode_steps} | alpha: {alpha:.4f}")
 
             writer.add_scalar("Train/episode_reward",    episode_reward,  episode)
@@ -555,3 +551,38 @@ class Agent:
                 if chain_score > self.best_chain_score:
                     self.best_chain_score = chain_score
                     self.save_best(episode, chain_score)
+
+                    # Confirm frontier bests on held-out seeds: n=10 windows
+                    # are noisy enough to fabricate wins (run 415 lesson), so
+                    # a checkpoint only counts once it repeats the score on
+                    # seeds it wasn't selected on.
+                    if chain_score >= confirm_bar:
+                        c_score, c_full, c_spin = self.chain_eval(
+                            n_episodes=confirm_episodes, seed_offset=1000)
+                        writer.add_scalar("Eval/chain_confirm_score", c_score, episode)
+                        writer.add_scalar("Eval/chain_confirm_full",  c_full,  episode)
+                        print(f"  [Confirm] episode {episode}: n={confirm_episodes} "
+                              f"score={c_score:.2f}/5 | full={c_full:.2f} | "
+                              f"spin={c_spin:.3f}")
+                        if c_score > self.best_confirmed_score:
+                            self.best_confirmed_score = c_score
+                            self.save_best(episode, c_score, c_full,
+                                           path="checkpoints/best_confirmed.pt")
+
+        # Final read inside this run (checkpoints do not persist across
+        # Beekeeper runs — run 416 lesson): re-eval the best checkpoint on 40
+        # fresh held-out seeds. This is the honest deployable number.
+        ckpt_path = ("checkpoints/best_confirmed.pt"
+                     if os.path.exists("checkpoints/best_confirmed.pt")
+                     else "checkpoints/best.pt")
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=self.device,
+                              weights_only=True)
+            self.actor.load_state_dict(ckpt["actor"])
+            f_score, f_full, f_spin = self.chain_eval(n_episodes=40,
+                                                      seed_offset=2000)
+            writer.add_scalar("Eval/final_confirm_score", f_score, episodes)
+            writer.add_scalar("Eval/final_confirm_full",  f_full,  episodes)
+            print(f"FINAL_CONFIRM ckpt={ckpt_path} ep={ckpt['episode']} n=40: "
+                  f"chain_score={f_score:.3f}/5 | chain_full={f_full:.3f} | "
+                  f"spin={f_spin:.3f}")
