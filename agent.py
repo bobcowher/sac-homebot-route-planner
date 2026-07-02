@@ -384,7 +384,8 @@ class Agent:
     def train(self, episodes=1000, batch_size=256, run_tag=None,
               eval_interval=50, eval_episodes=20, chain_eval_interval=10,
               goals_per_episode=5, her_anneal_start=None,
-              confirm_bar=4.2, confirm_episodes=30):
+              confirm_bar=4.2, confirm_episodes=30,
+              confirm_interval=250, confirm_start=500):
         """Chain-style training on the base (non-goal) env.
 
         Each episode: one reset, then `goals_per_episode` sequential random-tile
@@ -548,30 +549,45 @@ class Agent:
                       f"{len(DEFAULT_CHAIN)} | full_chain={chain_full:.2f} | "
                       f"spin={chain_spin:.3f}")
 
-                if chain_score > self.best_chain_score:
+                new_best = chain_score > self.best_chain_score
+                if new_best:
                     self.best_chain_score = chain_score
                     self.save_best(episode, chain_score)
 
-                    # Confirm frontier bests on held-out seeds: n=10 windows
-                    # are noisy enough to fabricate wins (run 415 lesson), so
-                    # a checkpoint only counts once it repeats the score on
-                    # seeds it wasn't selected on.
-                    if chain_score >= confirm_bar:
-                        c_score, c_full, c_spin = self.chain_eval(
-                            n_episodes=confirm_episodes, seed_offset=1000)
-                        writer.add_scalar("Eval/chain_confirm_score", c_score, episode)
-                        writer.add_scalar("Eval/chain_confirm_full",  c_full,  episode)
-                        print(f"  [Confirm] episode {episode}: n={confirm_episodes} "
-                              f"score={c_score:.2f}/5 | full={c_full:.2f} | "
-                              f"spin={c_spin:.3f}")
-                        if c_score > self.best_confirmed_score:
-                            self.best_confirmed_score = c_score
-                            self.save_best(episode, c_score, c_full,
-                                           path="checkpoints/best_confirmed.pt")
+                # Confirm on held-out seeds: n=10 windows are noisy enough to
+                # fabricate wins (run 415 lesson), so a checkpoint only counts
+                # once it repeats the score on seeds it wasn't selected on.
+                # Two triggers: a new frontier best, or the periodic timer —
+                # raw bests saturate at 5.0 early (run 418: the ep700 confirm
+                # blocked all later ones), so late policies need the timer to
+                # get measured at all.
+                periodic = (confirm_interval and episode >= confirm_start
+                            and episode % confirm_interval == 0)
+                if (new_best and chain_score >= confirm_bar) or periodic:
+                    c_score, c_full, c_spin = self.chain_eval(
+                        n_episodes=confirm_episodes, seed_offset=1000)
+                    writer.add_scalar("Eval/chain_confirm_score", c_score, episode)
+                    writer.add_scalar("Eval/chain_confirm_full",  c_full,  episode)
+                    print(f"  [Confirm] episode {episode}: n={confirm_episodes} "
+                          f"score={c_score:.2f}/5 | full={c_full:.2f} | "
+                          f"spin={c_spin:.3f}")
+                    if c_score > self.best_confirmed_score:
+                        self.best_confirmed_score = c_score
+                        self.save_best(episode, c_score, c_full,
+                                       path="checkpoints/best_confirmed.pt")
 
-        # Final read inside this run (checkpoints do not persist across
-        # Beekeeper runs — run 416 lesson): re-eval the best checkpoint on 40
-        # fresh held-out seeds. This is the honest deployable number.
+        # Final reads inside this run (checkpoints do not persist across
+        # Beekeeper runs — run 416 lesson), both on the same 40 fresh seeds:
+        # the end-of-training policy first (run 418's best artifact was the
+        # final policy and it went unmeasured), then the best confirmed
+        # checkpoint. Whichever wins is the deployable number.
+        f_score, f_full, f_spin = self.chain_eval(n_episodes=40, seed_offset=2000)
+        writer.add_scalar("Eval/final_policy_score", f_score, episodes)
+        writer.add_scalar("Eval/final_policy_full",  f_full,  episodes)
+        self.save_best(episodes - 1, f_score, f_full, path="checkpoints/final.pt")
+        print(f"FINAL_POLICY ep={episodes - 1} n=40: chain_score={f_score:.3f}/5 | "
+              f"chain_full={f_full:.3f} | spin={f_spin:.3f}")
+
         ckpt_path = ("checkpoints/best_confirmed.pt"
                      if os.path.exists("checkpoints/best_confirmed.pt")
                      else "checkpoints/best.pt")

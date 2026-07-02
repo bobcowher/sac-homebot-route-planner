@@ -24,9 +24,13 @@ agent = Agent(env=env, max_buffer_size=5000, use_motion=True, motion_window=8)
 
 # 1. Two training episodes, two legs each; batch_size huge so no grad steps
 #    (keeps CPU time down; train_step itself is unchanged from prior runs).
+#    confirm_bar=0 + confirm_interval=1 force the [Confirm] path, and the
+#    FINAL_POLICY/FINAL_CONFIRM n=40 evals run at the end.
 agent.train(episodes=2, batch_size=999999, run_tag="smoke",
-            eval_interval=10000, chain_eval_interval=10000,
-            goals_per_episode=2)
+            eval_interval=10000, chain_eval_interval=1,
+            goals_per_episode=2,
+            confirm_bar=0.0, confirm_episodes=1,
+            confirm_interval=1, confirm_start=1)
 print(f"SMOKE train loop OK | buffer fill={agent.memory.mem_ctr} "
       f"env_steps={agent.total_env_steps}")
 assert agent.memory.mem_ctr > 0, "HER flush stored nothing"
